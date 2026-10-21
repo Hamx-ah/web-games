@@ -317,7 +317,7 @@
                     + Manual WebRTC SDP Signaling Fallback (Serverless Copy/Paste)
                 </button>
                 <div id="sdp-panel" class="hidden mt-2 p-3 bg-black/60 border border-white/10 rounded-xs space-y-2">
-                    <div class="flex gap-2">
+                    <div class="flex flex-wrap gap-2">
                         <button id="sdp-offer-btn" class="px-2.5 py-1 bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-bold rounded-xs cursor-pointer">1. Generate Offer</button>
                         <button id="sdp-answer-btn" class="px-2.5 py-1 bg-sky-500/20 border border-sky-500/40 text-sky-300 text-xs font-bold rounded-xs cursor-pointer">2. Create Answer from Offer</button>
                         <button id="sdp-accept-btn" class="px-2.5 py-1 bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-bold rounded-xs cursor-pointer">3. Accept Answer</button>
@@ -1016,60 +1016,241 @@
             }
         };
 
+        const RTC_ICE_CONFIG = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' },
+                { urls: 'stun:global.stun.twilio.com:3478' }
+            ]
+        };
+
+        const PEER_BROKERS = [
+            // Default PeerJS Cloud Broker
+            { config: RTC_ICE_CONFIG, debug: 0 },
+            // Explicit PeerJS Cloud over 443
+            { host: '0.peerjs.com', port: 443, path: '/', secure: true, config: RTC_ICE_CONFIG, debug: 0 }
+        ];
+
         class WebRTCManager {
             constructor() {
                 this.peer = null;
                 this.conn = null;
                 this.rawPC = null;
                 this.rawDC = null;
+                this.bc = null;
                 this.roomCode = '';
+                this.isHostRole = false;
+                this.connected = false;
+                this.brokerIndex = 0;
+            }
+
+            cleanup() {
+                this.connected = false;
+                if (this.conn) {
+                    try { this.conn.close(); } catch (e) {}
+                    this.conn = null;
+                }
+                if (this.peer) {
+                    try { this.peer.destroy(); } catch (e) {}
+                    this.peer = null;
+                }
+                if (this.bc) {
+                    try { this.bc.close(); } catch (e) {}
+                    this.bc = null;
+                }
             }
 
             send(payload) {
                 if (this.conn && this.conn.open) {
-                    this.conn.send(payload);
-                } else if (this.rawDC && this.rawDC.readyState === 'open') {
-                    this.rawDC.send(JSON.stringify(payload));
+                    try { this.conn.send(payload); return; } catch (e) {}
+                }
+                if (this.rawDC && this.rawDC.readyState === 'open') {
+                    try { this.rawDC.send(JSON.stringify(payload)); return; } catch (e) {}
+                }
+                if (this.bc && this.connected) {
+                    try { this.bc.postMessage(payload); } catch (e) {}
+                }
+            }
+
+            setupLocalBroadcastFallback(code, asHost) {
+                if (typeof BroadcastChannel === 'undefined') return;
+                if (this.bc) {
+                    try { this.bc.close(); } catch (e) {}
+                }
+                this.bc = new BroadcastChannel('NIGHTFALL_ROOM_' + code);
+                this.bc.onmessage = (ev) => {
+                    const msg = ev.data;
+                    if (!msg) return;
+                    if (msg.type === 'BC_JOIN_REQ' && asHost && !this.connected) {
+                        this.bc.postMessage({ type: 'BC_JOIN_ACK' });
+                        this.onChannelConnected(true, 'LOCAL P2P');
+                    } else if (msg.type === 'BC_JOIN_ACK' && !asHost && !this.connected) {
+                        this.onChannelConnected(false, 'LOCAL P2P');
+                    } else if (this.connected) {
+                        handleNetworkMessage(msg);
+                    }
+                };
+                if (!asHost) {
+                    this.bc.postMessage({ type: 'BC_JOIN_REQ' });
                 }
             }
 
             hostRoom(onCodeReady) {
-                const randomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+                this.cleanup();
+                this.isHostRole = true;
+                const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+                let randomCode = '';
+                for (let i = 0; i < 6; i++) {
+                    randomCode += chars.charAt(Math.floor(Math.random() * chars.length));
+                }
                 this.roomCode = randomCode;
-                if (this.peer) this.peer.destroy();
+                onCodeReady(randomCode);
 
-                this.peer = new Peer('NIGHTFALL-' + randomCode);
+                // Enable instant same-browser / local-tab relay immediately
+                this.setupLocalBroadcastFallback(randomCode, true);
+
+                // Attempt WebRTC PeerJS Broker registration with fallback
+                this.tryHostWithBroker(randomCode, 0);
+            }
+
+            tryHostWithBroker(code, idx) {
+                if (this.connected) return;
+                if (typeof Peer === 'undefined') {
+                    document.getElementById('lobby-status').textContent = 'ROOM ' + code + ' READY (LOCAL TAB / SDP MODE)';
+                    return;
+                }
+
+                const peerId = 'nf-v2-room-' + code.toLowerCase();
+                const opts = PEER_BROKERS[idx] || PEER_BROKERS[0];
+
+                try {
+                    if (this.peer) {
+                        try { this.peer.destroy(); } catch (e) {}
+                    }
+                    this.peer = new Peer(peerId, opts);
+                } catch (err) {
+                    this.handleHostBrokerFailure(code, idx);
+                    return;
+                }
+
+                const timeoutId = setTimeout(() => {
+                    if (!this.connected && this.peer && !this.peer.open) {
+                        this.handleHostBrokerFailure(code, idx);
+                    }
+                }, 5500);
+
                 this.peer.on('open', () => {
-                    onCodeReady(randomCode);
+                    clearTimeout(timeoutId);
+                    document.getElementById('lobby-status').textContent = 'WAITING FOR CHALLENGER (CODE: ' + code + ')';
                 });
+
                 this.peer.on('connection', (connection) => {
+                    clearTimeout(timeoutId);
                     this.conn = connection;
                     this.setupPeerEvents(true);
                 });
+
                 this.peer.on('error', (err) => {
-                    document.getElementById('lobby-status').textContent = 'SIGNAL ERROR: ' + err.type;
+                    clearTimeout(timeoutId);
+                    if (err && err.type === 'unavailable-id') {
+                        // Regenerate room code if collision
+                        this.hostRoom((newCode) => {
+                            document.getElementById('host-room-code').value = newCode;
+                        });
+                        return;
+                    }
+                    this.handleHostBrokerFailure(code, idx);
                 });
+            }
+
+            handleHostBrokerFailure(code, idx) {
+                if (this.connected) return;
+                if (idx + 1 < PEER_BROKERS.length) {
+                    this.tryHostWithBroker(code, idx + 1);
+                } else {
+                    // Graceful fallback: Room still works via Local BroadcastChannel or Manual WebRTC SDP
+                    document.getElementById('lobby-status').textContent = 'ROOM ' + code + ' READY (LOCAL / SDP FALLBACK ACTIVE)';
+                    document.getElementById('sdp-panel').classList.remove('hidden');
+                    this.createManualOffer();
+                }
             }
 
             joinRoom(code) {
-                const clean = code.trim().toUpperCase();
-                if (!clean) return;
-                if (this.peer) this.peer.destroy();
+                const clean = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+                if (!clean || clean.length < 3) {
+                    document.getElementById('lobby-status').textContent = 'ENTER A VALID 6-DIGIT ROOM CODE';
+                    return;
+                }
+                this.cleanup();
+                this.isHostRole = false;
+                this.roomCode = clean;
 
-                document.getElementById('lobby-status').textContent = 'CONNECTING TO ' + clean + '...';
-                this.peer = new Peer();
+                document.getElementById('lobby-status').textContent = 'CONNECTING TO ROOM ' + clean + '...';
+
+                // Check local same-browser BroadcastChannel first
+                this.setupLocalBroadcastFallback(clean, false);
+
+                // Also connect via PeerJS WebRTC Broker
+                this.tryJoinWithBroker(clean, 0);
+            }
+
+            tryJoinWithBroker(code, idx) {
+                if (this.connected) return;
+                if (typeof Peer === 'undefined') {
+                    document.getElementById('lobby-status').textContent = 'BROKER BLOCKED - USE SDP PANEL BELOW';
+                    document.getElementById('sdp-panel').classList.remove('hidden');
+                    return;
+                }
+
+                const opts = PEER_BROKERS[idx] || PEER_BROKERS[0];
+                try {
+                    if (this.peer) {
+                        try { this.peer.destroy(); } catch (e) {}
+                    }
+                    this.peer = new Peer(opts);
+                } catch (err) {
+                    this.handleJoinBrokerFailure(code, idx);
+                    return;
+                }
+
+                const timeoutId = setTimeout(() => {
+                    if (!this.connected) {
+                        this.handleJoinBrokerFailure(code, idx);
+                    }
+                }, 6000);
+
                 this.peer.on('open', () => {
-                    this.conn = this.peer.connect('NIGHTFALL-' + clean, { reliable: false });
-                    this.setupPeerEvents(false);
+                    if (this.connected) {
+                        clearTimeout(timeoutId);
+                        return;
+                    }
+                    const targetPeerId = 'nf-v2-room-' + code.toLowerCase();
+                    this.conn = this.peer.connect(targetPeerId, { reliable: false, serialization: 'json' });
+                    this.setupPeerEvents(false, timeoutId);
                 });
-                this.peer.on('error', (err) => {
-                    document.getElementById('lobby-status').textContent = 'JOIN FAILED: ' + err.type;
+
+                this.peer.on('error', () => {
+                    clearTimeout(timeoutId);
+                    this.handleJoinBrokerFailure(code, idx);
                 });
             }
 
-            setupPeerEvents(asHost) {
+            handleJoinBrokerFailure(code, idx) {
+                if (this.connected) return;
+                if (idx + 1 < PEER_BROKERS.length) {
+                    this.tryJoinWithBroker(code, idx + 1);
+                } else {
+                    document.getElementById('lobby-status').textContent = 'CLOUD SIGNAL BLOCKED - USE MANUAL SDP BELOW';
+                    document.getElementById('sdp-panel').classList.remove('hidden');
+                }
+            }
+
+            setupPeerEvents(asHost, timeoutId = null) {
+                if (!this.conn) return;
                 this.conn.on('open', () => {
-                    this.onChannelConnected(asHost);
+                    if (timeoutId) clearTimeout(timeoutId);
+                    this.onChannelConnected(asHost, 'WEBRTC P2P');
                 });
                 this.conn.on('data', (data) => {
                     const parsed = typeof data === 'string' ? JSON.parse(data) : data;
@@ -1078,13 +1259,15 @@
                 this.conn.on('close', () => {
                     document.getElementById('net-role-tag').textContent = 'DISCONNECTED';
                     state.isMultiplayer = false;
+                    this.connected = false;
                 });
             }
 
             initRawPC(asHost) {
-                this.rawPC = new RTCPeerConnection({
-                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-                });
+                if (this.rawPC) {
+                    try { this.rawPC.close(); } catch (e) {}
+                }
+                this.rawPC = new RTCPeerConnection(RTC_ICE_CONFIG);
                 this.rawPC.onicecandidate = (e) => {
                     if (!e.candidate && this.rawPC.localDescription) {
                         document.getElementById('sdp-textarea').value = btoa(JSON.stringify(this.rawPC.localDescription));
@@ -1102,15 +1285,16 @@
             }
 
             bindRawDC(asHost) {
-                this.rawDC.onopen = () => this.onChannelConnected(asHost);
+                this.rawDC.onopen = () => this.onChannelConnected(asHost, 'SDP P2P');
                 this.rawDC.onmessage = (e) => handleNetworkMessage(JSON.parse(e.data));
             }
 
             async createManualOffer() {
-                this.initRawPC(true);
-                const offer = await this.rawPC.createOffer();
-                await this.rawPC.setLocalDescription(offer);
-                document.getElementById('lobby-status').textContent = 'GENERATING SDP OFFER...';
+                try {
+                    this.initRawPC(true);
+                    const offer = await this.rawPC.createOffer();
+                    await this.rawPC.setLocalDescription(offer);
+                } catch (e) {}
             }
 
             async createManualAnswer(encodedOffer) {
@@ -1136,7 +1320,9 @@
                 }
             }
 
-            onChannelConnected(asHost) {
+            onChannelConnected(asHost, transportLabel = 'WEBRTC P2P') {
+                if (this.connected) return;
+                this.connected = true;
                 sfx.init();
                 state.isMultiplayer = true;
                 state.isHost = asHost;
@@ -1149,11 +1335,11 @@
                 state.totalDamageDealt = 0;
                 state.isRunning = true;
 
-                document.getElementById('lobby-status').textContent = 'WEBRTC P2P CONNECTED!';
+                document.getElementById('lobby-status').textContent = transportLabel + ' CONNECTED!';
                 document.getElementById('net-role-tag').textContent = asHost ? 'P2P HOST' : 'P2P PEER';
                 document.getElementById('local-player-name').textContent = asHost ? 'Playemar (Host)' : 'Playemar (Peer)';
                 document.getElementById('menu-modal').classList.add('hidden');
-                canvas.requestPointerLock();
+                try { canvas.requestPointerLock(); } catch (e) {}
                 startRound();
             }
         }
@@ -2140,10 +2326,9 @@
 
         document.getElementById('create-room-btn').addEventListener('click', () => {
             sfx.init();
-            document.getElementById('lobby-status').textContent = 'INITIALIZING WEBRTC HOST...';
+            document.getElementById('lobby-status').textContent = 'CREATING ROOM...';
             net.hostRoom((code) => {
                 document.getElementById('host-room-code').value = code;
-                document.getElementById('lobby-status').textContent = 'WAITING FOR CHALLENGER (' + code + ')';
             });
         });
 
