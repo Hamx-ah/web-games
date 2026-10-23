@@ -243,6 +243,10 @@
         RELOADING...
     </div>
 
+    <div id="pointer-lock-prompt" class="absolute top-14 left-1/2 -translate-x-1/2 hidden pointer-events-none z-20 hud-panel px-5 py-2 rounded-sm border border-amber-400/80 text-amber-300 text-xs font-bold tracking-widest uppercase shadow-lg animate-pulse">
+        CLICK ANYWHERE ON THE ARENA TO LOCK MOUSE & AIM
+    </div>
+
     <div id="round-overlay" class="absolute inset-0 z-25 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm hidden pointer-events-none">
         <div id="round-banner-title" class="font-teko text-6xl font-bold tracking-widest uppercase text-amber-400">ROUND WON</div>
         <div id="round-banner-sub" class="text-sm tracking-widest text-slate-300 uppercase mt-1">ELIMINATED HOSTILE OPERATOR</div>
@@ -1025,11 +1029,11 @@
             ]
         };
 
-        const PEER_BROKERS = [
-            // Default PeerJS Cloud Broker
-            { config: RTC_ICE_CONFIG, debug: 0 },
-            // Explicit PeerJS Cloud over 443
-            { host: '0.peerjs.com', port: 443, path: '/', secure: true, config: RTC_ICE_CONFIG, debug: 0 }
+        // Public WebSocket MQTT brokers over port 443 (never blocked on Vercel / residential ISPs)
+        const MQTT_SIGNAL_URLS = [
+            'wss://broker.emqx.io:8084/mqtt',
+            'wss://broker.hivemq.com:8884/mqtt',
+            'wss://test.mosquitto.org:8081/mqtt'
         ];
 
         class WebRTCManager {
@@ -1039,14 +1043,22 @@
                 this.rawPC = null;
                 this.rawDC = null;
                 this.bc = null;
+                this.wsSignal = null;
                 this.roomCode = '';
                 this.isHostRole = false;
                 this.connected = false;
-                this.brokerIndex = 0;
+                this.usingLocalBC = false;
+                this.clientId = 'p_' + Math.random().toString(36).substring(2, 10);
+                this.pendingCandidates = [];
+                this.wsList = [];
+                this.lastRcvSeq = 0;
+                this.sendSeq = 0;
             }
 
             cleanup() {
                 this.connected = false;
+                this.usingLocalBC = false;
+                this.pendingCandidates = [];
                 if (this.conn) {
                     try { this.conn.close(); } catch (e) {}
                     this.conn = null;
@@ -1059,17 +1071,39 @@
                     try { this.bc.close(); } catch (e) {}
                     this.bc = null;
                 }
+                if (this.wsList && this.wsList.length) {
+                    this.wsList.forEach(w => { try { w.close(); } catch (e) {} });
+                    this.wsList = [];
+                }
+                if (this.joinRetryTimer) {
+                    clearInterval(this.joinRetryTimer);
+                    this.joinRetryTimer = null;
+                }
+                if (this.keepaliveTimer) {
+                    clearInterval(this.keepaliveTimer);
+                    this.keepaliveTimer = null;
+                }
             }
 
             send(payload) {
-                if (this.conn && this.conn.open) {
-                    try { this.conn.send(payload); return; } catch (e) {}
-                }
-                if (this.rawDC && this.rawDC.readyState === 'open') {
-                    try { this.rawDC.send(JSON.stringify(payload)); return; } catch (e) {}
-                }
-                if (this.bc && this.connected) {
+                if (!this.connected) return;
+                payload._seq = ++this.sendSeq;
+
+                // 1. Send via Local BroadcastChannel if connected locally
+                if (this.bc && this.usingLocalBC) {
                     try { this.bc.postMessage(payload); } catch (e) {}
+                }
+                // 2. Send via WebRTC DataChannel if open
+                if (this.rawDC && this.rawDC.readyState === 'open') {
+                    try { this.rawDC.send(JSON.stringify(payload)); } catch (e) {}
+                }
+                // 3. Send via PeerJS DataConnection if open
+                if (this.conn && this.conn.open) {
+                    try { this.conn.send(payload); } catch (e) {}
+                }
+                // 4. Always mirror over WSS MQTT Relay so symmetric NAT / dead UDP never drops movement
+                if (this.mqttPub) {
+                    try { this.mqttPub({ type: 'GAME_RELAY', from: this.clientId, payload }); } catch (e) {}
                 }
             }
 
@@ -1082,10 +1116,12 @@
                 this.bc.onmessage = (ev) => {
                     const msg = ev.data;
                     if (!msg) return;
-                    if (msg.type === 'BC_JOIN_REQ' && asHost && !this.connected) {
+                    if (msg.type === 'BC_JOIN_REQ' && asHost) {
+                        this.usingLocalBC = true;
                         this.bc.postMessage({ type: 'BC_JOIN_ACK' });
                         this.onChannelConnected(true, 'LOCAL P2P');
-                    } else if (msg.type === 'BC_JOIN_ACK' && !asHost && !this.connected) {
+                    } else if (msg.type === 'BC_JOIN_ACK' && !asHost) {
+                        this.usingLocalBC = true;
                         this.onChannelConnected(false, 'LOCAL P2P');
                     } else if (this.connected) {
                         handleNetworkMessage(msg);
@@ -1093,6 +1129,263 @@
                 };
                 if (!asHost) {
                     this.bc.postMessage({ type: 'BC_JOIN_REQ' });
+                }
+            }
+
+            // Lightweight MQTT-over-WebSockets (WSS port 443) packet helpers for zero-dependency signaling
+            encodeMqttString(str) {
+                const enc = new TextEncoder().encode(str);
+                const out = new Uint8Array(2 + enc.length);
+                out[0] = (enc.length >> 8) & 0xff;
+                out[1] = enc.length & 0xff;
+                out.set(enc, 2);
+                return out;
+            }
+
+            encodeMqttRemLen(len) {
+                const bytes = [];
+                do {
+                    let digit = len % 128;
+                    len = Math.floor(len / 128);
+                    if (len > 0) digit |= 0x80;
+                    bytes.push(digit);
+                } while (len > 0);
+                return new Uint8Array(bytes);
+            }
+
+            buildMqttConnect() {
+                const proto = this.encodeMqttString('MQTT');
+                const cid = this.encodeMqttString('nf_' + this.clientId + '_' + Math.floor(Math.random() * 999));
+                const varHdr = new Uint8Array([0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x3c]);
+                const remLen = varHdr.length + cid.length;
+                const remBytes = this.encodeMqttRemLen(remLen);
+                const pkt = new Uint8Array(1 + remBytes.length + remLen);
+                pkt[0] = 0x10;
+                pkt.set(remBytes, 1);
+                pkt.set(varHdr, 1 + remBytes.length);
+                pkt.set(cid, 1 + remBytes.length + varHdr.length);
+                return pkt;
+            }
+
+            buildMqttSubscribe(topic) {
+                const tBytes = this.encodeMqttString(topic);
+                const remLen = 2 + tBytes.length + 1;
+                const remBytes = this.encodeMqttRemLen(remLen);
+                const pkt = new Uint8Array(1 + remBytes.length + remLen);
+                pkt[0] = 0x82;
+                pkt.set(remBytes, 1);
+                let offset = 1 + remBytes.length;
+                pkt[offset++] = 0x00;
+                pkt[offset++] = 0x0a;
+                pkt.set(tBytes, offset);
+                pkt[offset + tBytes.length] = 0x00;
+                return pkt;
+            }
+
+            buildMqttPublish(topic, jsonObj) {
+                const tBytes = this.encodeMqttString(topic);
+                const pBytes = new TextEncoder().encode(JSON.stringify(jsonObj));
+                const remLen = tBytes.length + pBytes.length;
+                const remBytes = this.encodeMqttRemLen(remLen);
+                const pkt = new Uint8Array(1 + remBytes.length + remLen);
+                pkt[0] = 0x30;
+                pkt.set(remBytes, 1);
+                pkt.set(tBytes, 1 + remBytes.length);
+                pkt.set(pBytes, 1 + remBytes.length + tBytes.length);
+                return pkt;
+            }
+
+            connectMultiMqttRoom(code, asHost) {
+                const topic = 'nightfall/v3/room/' + code.toUpperCase();
+                this.wsList = [];
+
+                this.mqttPub = (obj) => {
+                    const pkt = this.buildMqttPublish(topic, obj);
+                    this.wsList.forEach(ws => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            try { ws.send(pkt); } catch (e) {}
+                        }
+                    });
+                };
+
+                MQTT_SIGNAL_URLS.forEach((url) => {
+                    let ws;
+                    try {
+                        ws = new WebSocket(url, 'mqtt');
+                        ws.binaryType = 'arraybuffer';
+                    } catch (e) {
+                        return;
+                    }
+                    this.wsList.push(ws);
+
+                    ws.onopen = () => {
+                        try {
+                            ws.send(this.buildMqttConnect());
+                        } catch (e) {}
+                    };
+
+                    ws.onmessage = (ev) => {
+                        const buf = new Uint8Array(ev.data);
+                        if (!buf || buf.length < 2) return;
+
+                        let offset = 0;
+                        while (offset < buf.length) {
+                            const headerByte = buf[offset];
+                            const type = headerByte >> 4;
+                            let idx = offset + 1;
+                            let mult = 1;
+                            let remLen = 0;
+                            let digit = 0;
+                            do {
+                                if (idx >= buf.length) return;
+                                digit = buf[idx++];
+                                remLen += (digit & 127) * mult;
+                                mult *= 128;
+                            } while ((digit & 128) !== 0);
+
+                            const packetEnd = idx + remLen;
+                            if (packetEnd > buf.length) break;
+
+                            if (type === 2) {
+                                // CONNACK -> Subscribe to room topic
+                                try { ws.send(this.buildMqttSubscribe(topic)); } catch (e) {}
+                                if (asHost) {
+                                    document.getElementById('lobby-status').textContent = 'WAITING FOR CHALLENGER (CODE: ' + code + ')';
+                                } else {
+                                    this.mqttPub({ type: 'HELLO_HOST', from: this.clientId });
+                                }
+                            } else if (type === 3) {
+                                // PUBLISH packet received
+                                const topicLen = (buf[idx] << 8) | buf[idx + 1];
+                                const payloadStart = idx + 2 + topicLen;
+                                // If QoS > 0, skip 2-byte packet identifier
+                                const qos = (headerByte & 0x06) >> 1;
+                                const actualStart = qos > 0 ? payloadStart + 2 : payloadStart;
+                                if (actualStart <= packetEnd) {
+                                    const payloadBytes = buf.slice(actualStart, packetEnd);
+                                    try {
+                                        const text = new TextDecoder().decode(payloadBytes);
+                                        const msg = JSON.parse(text);
+                                        this.onSignalingMessage(msg, asHost);
+                                    } catch (e) {}
+                                }
+                            }
+                            offset = packetEnd;
+                        }
+                    };
+                });
+
+                // Send MQTT PINGREQ every 20s so brokers never drop idle connections
+                this.keepaliveTimer = setInterval(() => {
+                    const pingPkt = new Uint8Array([0xc0, 0x00]);
+                    this.wsList.forEach(ws => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            try { ws.send(pingPkt); } catch (e) {}
+                        }
+                    });
+                }, 20000);
+
+                if (!asHost) {
+                    this.joinRetryTimer = setInterval(() => {
+                        if (this.connected) {
+                            clearInterval(this.joinRetryTimer);
+                            return;
+                        }
+                        this.mqttPub({ type: 'HELLO_HOST', from: this.clientId });
+                    }, 1200);
+                }
+            }
+
+            async onSignalingMessage(msg, asHost) {
+                if (!msg || msg.from === this.clientId) return;
+
+                if (msg.type === 'GAME_RELAY') {
+                    if (!this.connected) {
+                        this.onChannelConnected(asHost, 'WSS CLOUD RELAY');
+                    }
+                    handleNetworkMessage(msg.payload);
+                    return;
+                }
+
+                if (asHost && msg.type === 'HELLO_HOST') {
+                    // Immediately ACK over WSS so both sides can start syncing right away while WebRTC upgrades in background
+                    this.mqttPub({ type: 'FORCE_RELAY_START', from: this.clientId });
+                    if (!this.connected) {
+                        document.getElementById('lobby-status').textContent = 'CHALLENGER FOUND! LAUNCHING...';
+                        this.onChannelConnected(true, 'WSS + WEBRTC P2P');
+                    }
+                    this.setupAutoWebRTC(true);
+                    try {
+                        const offer = await this.rawPC.createOffer();
+                        await this.rawPC.setLocalDescription(offer);
+                        this.mqttPub({
+                            type: 'SDP_OFFER',
+                            from: this.clientId,
+                            sdp: this.rawPC.localDescription
+                        });
+                    } catch (e) {}
+                } else if (!asHost && msg.type === 'SDP_OFFER') {
+                    if (!this.connected) {
+                        this.onChannelConnected(false, 'WSS + WEBRTC P2P');
+                    }
+                    this.setupAutoWebRTC(false);
+                    try {
+                        await this.rawPC.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                        for (const c of this.pendingCandidates) {
+                            try { await this.rawPC.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+                        }
+                        this.pendingCandidates = [];
+                        const answer = await this.rawPC.createAnswer();
+                        await this.rawPC.setLocalDescription(answer);
+                        this.mqttPub({
+                            type: 'SDP_ANSWER',
+                            from: this.clientId,
+                            sdp: this.rawPC.localDescription
+                        });
+                    } catch (e) {}
+                } else if (asHost && msg.type === 'SDP_ANSWER') {
+                    try {
+                        if (this.rawPC && this.rawPC.signalingState !== 'stable') {
+                            await this.rawPC.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                            for (const c of this.pendingCandidates) {
+                                try { await this.rawPC.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+                            }
+                            this.pendingCandidates = [];
+                        }
+                    } catch (e) {}
+                } else if (msg.type === 'ICE_CAND') {
+                    if (this.rawPC && this.rawPC.remoteDescription && this.rawPC.remoteDescription.type) {
+                        try { await this.rawPC.addIceCandidate(new RTCIceCandidate(msg.cand)); } catch (e) {}
+                    } else {
+                        this.pendingCandidates.push(msg.cand);
+                    }
+                } else if (msg.type === 'FORCE_RELAY_START' && !this.connected) {
+                    this.onChannelConnected(asHost, 'WSS + WEBRTC P2P');
+                }
+            }
+
+            setupAutoWebRTC(asHost) {
+                if (this.rawPC) {
+                    try { this.rawPC.close(); } catch (e) {}
+                }
+                this.rawPC = new RTCPeerConnection(RTC_ICE_CONFIG);
+                this.rawPC.onicecandidate = (e) => {
+                    if (e.candidate && this.mqttPub) {
+                        this.mqttPub({
+                            type: 'ICE_CAND',
+                            from: this.clientId,
+                            cand: e.candidate
+                        });
+                    }
+                };
+                if (asHost) {
+                    this.rawDC = this.rawPC.createDataChannel('tactical1v1', { ordered: false, maxRetransmits: 0 });
+                    this.bindRawDC(true);
+                } else {
+                    this.rawPC.ondatachannel = (e) => {
+                        this.rawDC = e.channel;
+                        this.bindRawDC(false);
+                    };
                 }
             }
 
@@ -1107,73 +1400,27 @@
                 this.roomCode = randomCode;
                 onCodeReady(randomCode);
 
-                // Enable instant same-browser / local-tab relay immediately
+                // 1. Instant same-browser / local-tab relay
                 this.setupLocalBroadcastFallback(randomCode, true);
 
-                // Attempt WebRTC PeerJS Broker registration with fallback
-                this.tryHostWithBroker(randomCode, 0);
+                // 2. Multi-broker WSS signaling (works on Vercel & strict networks)
+                this.connectMultiMqttRoom(randomCode, true);
+
+                // 3. Secondary PeerJS listener in parallel
+                this.tryHostPeerJS(randomCode);
             }
 
-            tryHostWithBroker(code, idx) {
-                if (this.connected) return;
-                if (typeof Peer === 'undefined') {
-                    document.getElementById('lobby-status').textContent = 'ROOM ' + code + ' READY (LOCAL TAB / SDP MODE)';
-                    return;
-                }
-
-                const peerId = 'nf-v2-room-' + code.toLowerCase();
-                const opts = PEER_BROKERS[idx] || PEER_BROKERS[0];
-
+            tryHostPeerJS(code) {
+                if (typeof Peer === 'undefined') return;
                 try {
-                    if (this.peer) {
-                        try { this.peer.destroy(); } catch (e) {}
-                    }
-                    this.peer = new Peer(peerId, opts);
-                } catch (err) {
-                    this.handleHostBrokerFailure(code, idx);
-                    return;
-                }
-
-                const timeoutId = setTimeout(() => {
-                    if (!this.connected && this.peer && !this.peer.open) {
-                        this.handleHostBrokerFailure(code, idx);
-                    }
-                }, 5500);
-
-                this.peer.on('open', () => {
-                    clearTimeout(timeoutId);
-                    document.getElementById('lobby-status').textContent = 'WAITING FOR CHALLENGER (CODE: ' + code + ')';
-                });
-
-                this.peer.on('connection', (connection) => {
-                    clearTimeout(timeoutId);
-                    this.conn = connection;
-                    this.setupPeerEvents(true);
-                });
-
-                this.peer.on('error', (err) => {
-                    clearTimeout(timeoutId);
-                    if (err && err.type === 'unavailable-id') {
-                        // Regenerate room code if collision
-                        this.hostRoom((newCode) => {
-                            document.getElementById('host-room-code').value = newCode;
-                        });
-                        return;
-                    }
-                    this.handleHostBrokerFailure(code, idx);
-                });
-            }
-
-            handleHostBrokerFailure(code, idx) {
-                if (this.connected) return;
-                if (idx + 1 < PEER_BROKERS.length) {
-                    this.tryHostWithBroker(code, idx + 1);
-                } else {
-                    // Graceful fallback: Room still works via Local BroadcastChannel or Manual WebRTC SDP
-                    document.getElementById('lobby-status').textContent = 'ROOM ' + code + ' READY (LOCAL / SDP FALLBACK ACTIVE)';
-                    document.getElementById('sdp-panel').classList.remove('hidden');
-                    this.createManualOffer();
-                }
+                    const peerId = 'nf-v3-room-' + code.toLowerCase();
+                    this.peer = new Peer(peerId, { config: RTC_ICE_CONFIG, debug: 0 });
+                    this.peer.on('connection', (connection) => {
+                        this.conn = connection;
+                        this.setupPeerEvents(true);
+                    });
+                    this.peer.on('error', () => {});
+                } catch (e) {}
             }
 
             joinRoom(code) {
@@ -1188,62 +1435,28 @@
 
                 document.getElementById('lobby-status').textContent = 'CONNECTING TO ROOM ' + clean + '...';
 
-                // Check local same-browser BroadcastChannel first
+                // 1. Check local same-browser BroadcastChannel first
                 this.setupLocalBroadcastFallback(clean, false);
 
-                // Also connect via PeerJS WebRTC Broker
-                this.tryJoinWithBroker(clean, 0);
+                // 2. Connect via multi-broker WSS signaling (bypasses PeerJS cloud blocks)
+                this.connectMultiMqttRoom(clean, false);
+
+                // 3. Also attempt PeerJS in parallel
+                this.tryJoinPeerJS(clean);
             }
 
-            tryJoinWithBroker(code, idx) {
-                if (this.connected) return;
-                if (typeof Peer === 'undefined') {
-                    document.getElementById('lobby-status').textContent = 'BROKER BLOCKED - USE SDP PANEL BELOW';
-                    document.getElementById('sdp-panel').classList.remove('hidden');
-                    return;
-                }
-
-                const opts = PEER_BROKERS[idx] || PEER_BROKERS[0];
+            tryJoinPeerJS(code) {
+                if (typeof Peer === 'undefined') return;
                 try {
-                    if (this.peer) {
-                        try { this.peer.destroy(); } catch (e) {}
-                    }
-                    this.peer = new Peer(opts);
-                } catch (err) {
-                    this.handleJoinBrokerFailure(code, idx);
-                    return;
-                }
-
-                const timeoutId = setTimeout(() => {
-                    if (!this.connected) {
-                        this.handleJoinBrokerFailure(code, idx);
-                    }
-                }, 6000);
-
-                this.peer.on('open', () => {
-                    if (this.connected) {
-                        clearTimeout(timeoutId);
-                        return;
-                    }
-                    const targetPeerId = 'nf-v2-room-' + code.toLowerCase();
-                    this.conn = this.peer.connect(targetPeerId, { reliable: false, serialization: 'json' });
-                    this.setupPeerEvents(false, timeoutId);
-                });
-
-                this.peer.on('error', () => {
-                    clearTimeout(timeoutId);
-                    this.handleJoinBrokerFailure(code, idx);
-                });
-            }
-
-            handleJoinBrokerFailure(code, idx) {
-                if (this.connected) return;
-                if (idx + 1 < PEER_BROKERS.length) {
-                    this.tryJoinWithBroker(code, idx + 1);
-                } else {
-                    document.getElementById('lobby-status').textContent = 'CLOUD SIGNAL BLOCKED - USE MANUAL SDP BELOW';
-                    document.getElementById('sdp-panel').classList.remove('hidden');
-                }
+                    this.peer = new Peer({ config: RTC_ICE_CONFIG, debug: 0 });
+                    this.peer.on('open', () => {
+                        if (this.connected) return;
+                        const targetPeerId = 'nf-v3-room-' + code.toLowerCase();
+                        this.conn = this.peer.connect(targetPeerId, { reliable: false, serialization: 'json' });
+                        this.setupPeerEvents(false);
+                    });
+                    this.peer.on('error', () => {});
+                } catch (e) {}
             }
 
             setupPeerEvents(asHost, timeoutId = null) {
@@ -1323,6 +1536,8 @@
             onChannelConnected(asHost, transportLabel = 'WEBRTC P2P') {
                 if (this.connected) return;
                 this.connected = true;
+                this.lastRcvSeq = 0;
+                this.sendSeq = 0;
                 sfx.init();
                 state.isMultiplayer = true;
                 state.isHost = asHost;
@@ -1339,17 +1554,25 @@
                 document.getElementById('net-role-tag').textContent = asHost ? 'P2P HOST' : 'P2P PEER';
                 document.getElementById('local-player-name').textContent = asHost ? 'Playemar (Host)' : 'Playemar (Peer)';
                 document.getElementById('menu-modal').classList.add('hidden');
-                try { canvas.requestPointerLock(); } catch (e) {}
+                if (document.pointerLockElement !== canvas) {
+                    document.getElementById('pointer-lock-prompt').classList.remove('hidden');
+                }
                 startRound();
             }
         }
 
         const net = new WebRTCManager();
 
+        const seenEventSeqs = new Set();
+
         function handleNetworkMessage(msg) {
             if (!msg || !msg.type) return;
 
             if (msg.type === 'STATE') {
+                // Ignore duplicate or older out-of-order position packets
+                if (msg._seq && msg._seq <= net.lastRcvSeq) return;
+                if (msg._seq) net.lastRcvSeq = msg._seq;
+
                 state.ai.netTargetPos.set(msg.x, msg.y, msg.z);
                 state.ai.netYaw = msg.yaw;
                 state.ai.netPitch = msg.pitch;
@@ -1357,7 +1580,20 @@
                 state.ai.hp = msg.hp;
                 state.ai.ap = msg.ap;
                 updateHUD();
-            } else if (msg.type === 'SHOOT') {
+                return;
+            }
+
+            // Deduplicate discrete event packets across parallel transports
+            if (msg._seq) {
+                if (seenEventSeqs.has(msg._seq)) return;
+                seenEventSeqs.add(msg._seq);
+                if (seenEventSeqs.size > 300) {
+                    const first = seenEventSeqs.values().next().value;
+                    seenEventSeqs.delete(first);
+                }
+            }
+
+            if (msg.type === 'SHOOT') {
                 sfx.playGunshot(true);
                 enemy.muzzleFlash.material.opacity = 0.95;
                 const startVec = new THREE.Vector3(msg.sx, msg.sy, msg.sz);
@@ -1434,10 +1670,25 @@
             keys[e.code] = false;
         });
 
+        document.addEventListener('pointerlockchange', () => {
+            const promptEl = document.getElementById('pointer-lock-prompt');
+            if (!promptEl) return;
+            if (document.pointerLockElement === canvas) {
+                promptEl.classList.add('hidden');
+            } else if (state.isRunning) {
+                promptEl.classList.remove('hidden');
+            }
+        });
+
         window.addEventListener('mousedown', (e) => {
             if (!state.isRunning) return;
             if (document.pointerLockElement !== canvas) {
-                canvas.requestPointerLock();
+                try {
+                    const lockPromise = canvas.requestPointerLock();
+                    if (lockPromise && typeof lockPromise.catch === 'function') {
+                        lockPromise.catch(() => {});
+                    }
+                } catch (err) {}
                 return;
             }
             if (e.button === 0) isMouseDown = true;
@@ -2229,8 +2480,10 @@
 
             state.ai.pos.set(localSouthSpawn ? 2.5 : -2.5, 0, localSouthSpawn ? -14.5 : 14.5);
             state.ai.netTargetPos.copy(state.ai.pos);
+            state.ai.netYaw = localSouthSpawn ? 0 : Math.PI;
             state.ai.hp = 100;
             state.ai.ap = 50;
+            enemy.root.position.copy(state.ai.pos);
             enemy.root.scale.y = 1.0;
             enemy.root.visible = true;
 
@@ -2239,6 +2492,21 @@
             document.getElementById('round-overlay').classList.add('hidden');
             document.getElementById('reload-banner').classList.add('hidden');
             updateHUD();
+
+            if (state.isMultiplayer) {
+                const targetEyeHeight = state.player.isCrouching ? 1.12 : 1.72;
+                net.send({
+                    type: 'STATE',
+                    x: state.player.pos.x,
+                    y: state.player.pos.y - targetEyeHeight,
+                    z: state.player.pos.z,
+                    yaw: state.player.yaw,
+                    pitch: state.player.pitch,
+                    crouch: state.player.isCrouching,
+                    hp: state.player.hp,
+                    ap: state.player.ap
+                });
+            }
         }
 
         function endRound(playerWon) {
@@ -2387,7 +2655,12 @@
             document.getElementById('net-role-tag').textContent = 'VS AI BOT';
             document.getElementById('ping-display').textContent = '0 ms';
             document.getElementById('menu-modal').classList.add('hidden');
-            canvas.requestPointerLock();
+            try {
+                const lockPromise = canvas.requestPointerLock();
+                if (lockPromise && typeof lockPromise.catch === 'function') {
+                    lockPromise.catch(() => {});
+                }
+            } catch (err) {}
             startRound();
         });
 
